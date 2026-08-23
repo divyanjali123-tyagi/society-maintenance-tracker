@@ -1,0 +1,19 @@
+node_modules/
+dist/
+build/
+.next/
+out/
+.env
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# SQLite dev database + prisma migration lock
+backend/dev.db
+backend/prisma/dev.db
+backend/prisma/migrations/
+
+# Uploaded complaint photos (keep folder, ignore contents)
+backend/uploads/*
+!backend/uploads/.gitkeep

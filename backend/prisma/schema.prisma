@@ -1,0 +1,63 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  name      String
+  email     String   @unique
+  password  String
+  role      String   @default("RESIDENT")
+  flatNo    String?
+  createdAt DateTime @default(now())
+
+  complaints    Complaint[]      @relation("ResidentComplaints")
+  statusChanges ComplaintHistory[] @relation("ActorHistory")
+  notices       Notice[]         @relation("AuthorNotices")
+}
+
+model Complaint {
+  id          Int      @id @default(autoincrement())
+  title       String
+  category    String
+  description String
+  photoUrl    String?
+  status      String   @default("OPEN")
+  priority    String   @default("LOW")
+  isClosed    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  resolvedAt  DateTime?
+
+  resident   User @relation("ResidentComplaints", fields: [residentId], references: [id])
+  residentId Int
+
+  history ComplaintHistory[]
+}
+
+model ComplaintHistory {
+  id          Int      @id @default(autoincrement())
+  complaint   Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  complaintId Int
+  status      String
+  note        String?
+  actor       User     @relation("ActorHistory", fields: [actorId], references: [id])
+  actorId     Int
+  createdAt   DateTime @default(now())
+}
+
+model Notice {
+  id          Int      @id @default(autoincrement())
+  title       String
+  content     String
+  isImportant Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  author   User @relation("AuthorNotices", fields: [authorId], references: [id])
+  authorId Int
+}
