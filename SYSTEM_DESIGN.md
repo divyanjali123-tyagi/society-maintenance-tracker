@@ -1,109 +1,50 @@
-# System Design Write-Up
+System Design Write-Up
+1. Complaint History Model
 
-## 1. Complaint History Model
+A complaint moves through three states: OPEN, IN_PROGRESS, RESOLVED. I didn't want to just overwrite a single status field every time that happens, because then you lose the whole story of what happened. So instead, every status change gets appended as its own row in a separate ComplaintHistory table:
 
-A complaint's lifecycle is `OPEN → IN_PROGRESS → RESOLVED`. Rather than
-overwriting a single `status` column and losing the past, every change is
-appended as a new row in a separate `ComplaintHistory` table:
-
-```
 ComplaintHistory { id, complaintId, status, note, actorId, createdAt }
-```
 
-The `Complaint` row itself keeps a `status` field too (a denormalized "current
-state") purely so list/filter queries stay simple and fast — the admin
-complaints table doesn't need to join and aggregate history just to know a
-complaint's current status. But the *source of truth* for "what happened and
-when" is always the history table, which is append-only and never edited or
-deleted. Each row records:
+The Complaint row still keeps its own status field, and that's a deliberate bit of denormalization, not an oversight. The admin's complaints table needs to filter and sort by status constantly, and I didn't want every one of those queries joining out to history and aggregating just to figure out "is this still open?" So Complaint.status is the fast, current-state snapshot, and ComplaintHistory is the actual source of truth for what happened and when. It's append-only, meaning nothing in the app ever edits or deletes a history row.
 
-- **status** — the state the complaint moved into
-- **note** — an optional free-text note from the actor (e.g. "Plumber
-  scheduled for Tuesday")
-- **actorId** — who made the change (the resident, at creation; the admin, on
-  every subsequent update), giving a full audit trail of who touched what
-- **createdAt** — timestamp
+Each row captures:
 
-The very first row is created atomically with the complaint itself ("Complaint
-raised"), so the timeline always starts at creation rather than at the first
-admin action. When a complaint is resolved, `isClosed` is set to `true` and
-`resolvedAt` is stamped; closed complaints are locked from further status
-changes (enforced server-side), matching the requirement that resolving a
-complaint closes it.
+status – the state the complaint moved into
+note – an optional message from whoever made the change (something like "Plumber scheduled for Tuesday")
+actorId – who did it. At creation this is the resident; every update after that is an admin. This is what gives us the audit trail, so you can always answer "who touched this complaint and when."
+createdAt – timestamp
 
-This design was chosen over alternatives like a JSON blob of history on the
-complaint row because a relational table lets us query, filter, and sort
-history entries (e.g. "who last touched this"), enforces referential
-integrity to `User` via a foreign key, and scales cleanly if we later want to
-report on admin response times per person.
+One detail I made sure of: the first history row ("Complaint raised") gets created in the same transaction as the complaint itself, so the timeline never has a gap between "complaint exists" and "first history entry." When a complaint gets resolved, isClosed flips to true and resolvedAt gets stamped, and from that point the server refuses any further status changes on it. Closed really means closed.
 
-## 2. Overdue Detection
+I considered just storing history as a JSON blob on the complaint row instead, but that gives up too much. A real table means I can query and filter history entries directly (e.g., "show me everything this admin touched last week"), I get referential integrity to User for free via a foreign key, and if we ever want to report on response times per admin, the data's already there in a queryable shape.
 
-Overdue status is **not** stored as a column that a background job flips —
-it's computed on every read from two inputs: the complaint's `createdAt` and
-a configurable `OVERDUE_THRESHOLD_DAYS` environment variable. A complaint is
-overdue if it is not `RESOLVED`/`isClosed` and `now - createdAt` exceeds the
-threshold. This is deliberately stateless:
+2. Overdue Detection
 
-- **No cron job or scheduler needed**, which removes an entire class of bugs
-  (stale flags if the job doesn't run, timezone drift, etc.) and keeps the
-  app deployable on any free-tier host without a worker process.
-- **Always accurate**: the moment you change `OVERDUE_THRESHOLD_DAYS` in
-  `.env`, every complaint's overdue status re-evaluates correctly on the next
-  request — no backfill needed.
-- The admin complaints list annotates each complaint with `overdue` (boolean)
-  and `daysOpen` (integer), then **sorts overdue complaints to the top**,
-  followed by priority (`HIGH → MEDIUM → LOW`) and recency — satisfying the
-  requirement that overdue items surface prominently without a separate
-  "overdue" filter the admin has to remember to apply.
-- The dashboard's `overdueCount` uses the same `isOverdue()` helper so the
-  number on the dashboard always matches what's flagged in the list — one
-  function, one definition of "overdue," used everywhere.
+I didn't want "overdue" to be a stored flag that some background job has to flip. That's a whole category of bugs waiting to happen (job doesn't run, timezone gets weird, flag goes stale). Instead it's computed fresh on every read, from just two things: the complaint's createdAt and an OVERDUE_THRESHOLD_DAYS value read from the environment. If a complaint isn't resolved/closed and the time since it was created is past that threshold, it's overdue. That's it, no cron, no worker process, nothing to babysit.
 
-## 3. Photo Handling
+That also means the app stays honest about its own numbers: change OVERDUE_THRESHOLD_DAYS in .env and every complaint's overdue status is correct on the very next request, no backfill script required.
 
-Residents can attach one photo per complaint via `multipart/form-data`,
-handled by Multer. On upload:
+A couple of places this shows up:
 
-1. Only `image/jpeg`, `image/png`, `image/webp` are accepted; anything else
-   is rejected with a clear error before it touches disk.
-2. File size is capped at 5MB to prevent abuse.
-3. Each file is renamed to a collision-proof `complaint-<timestamp>-<random>.<ext>`
-   so two residents uploading `photo.jpg` at once never clash.
-4. The file is written to `backend/uploads/` and served statically at
-   `/uploads/<filename>`; the `Complaint.photoUrl` column stores just that
-   relative path, not the binary — keeping the database small and portable
-   between SQLite (demo) and Postgres (production).
+The admin complaints list tags each complaint with overdue (boolean) and daysOpen (integer), and sorts so overdue items float to the top, then by priority (HIGH → MEDIUM → LOW), then by recency. Admins shouldn't have to remember to apply an "overdue" filter, it should just be in their face.
+The dashboard's overdueCount calls the exact same isOverdue() helper the list uses. One function, one definition of overdue, everywhere it's used, so the dashboard number and the list are never out of sync with each other.
+3. Photo Handling
 
-For a real production deployment, local disk storage is a known limitation:
-most free hosts (Render, Railway) use ephemeral filesystems, so uploaded
-photos would be lost on redeploy. The system is intentionally decoupled so
-this is a one-file change — swapping `middleware/upload.js` to stream to
-Cloudinary/S3 and store the resulting CDN URL in the same `photoUrl` column,
-with zero changes needed anywhere else in the app (the frontend already just
-renders whatever URL it's given).
+Residents can attach one photo to a complaint, sent as multipart/form-data and handled by Multer. A few guardrails on the way in:
 
-## 4. Notification Flow
+Only image/jpeg, image/png, and image/webp get through; anything else is rejected before it ever touches disk.
+5MB size cap, just to keep someone from dumping a huge file in and eating up storage.
+Every file gets renamed to complaint-<timestamp>-<random>.<ext> on the way in, so if two residents both upload a file called photo.jpg at the same moment, they don't stomp on each other.
 
-Two events trigger email notifications, both handled by a single
-`utils/email.js` wrapper around Nodemailer:
+The file itself lands in backend/uploads/ and gets served statically from /uploads/<filename>. The database only ever stores that relative path in Complaint.photoUrl, never the binary. That keeps the DB small and means it doesn't matter whether we're on SQLite for the demo or Postgres in production; the storage layer doesn't care.
 
-- **Complaint status change**: when an admin calls `PATCH
-  /complaints/:id/status`, after the history row is written the resident's
-  email is looked up and an email is fired describing the new status and any
-  note. This is **fire-and-forget** relative to the HTTP response — the API
-  responds immediately with the updated complaint, and the email send happens
-  asynchronously so a slow/broken SMTP provider never blocks or fails the
-  admin's action.
-- **Important notice posted**: when an admin creates a notice with
-  `isImportant: true`, every resident is emailed in parallel
-  (`Promise.all`), again fire-and-forget.
+Worth flagging honestly: local disk storage is fine for a demo but not something I'd want to ship as-is. Most free hosts (Render, Railway) wipe the filesystem on every redeploy, so photos wouldn't survive. I set it up so that's a small fix rather than a rewrite, though. Swap out middleware/upload.js to stream to something like Cloudinary or S3 and store the CDN URL in that same photoUrl column, and nothing else in the app needs to change. The frontend already just renders whatever URL it's handed.
 
-Both paths funnel through the same `sendEmail()` function, which has a
-**debug mode** (`EMAIL_DEBUG=true`, or simply missing SMTP credentials): in
-that mode, instead of attempting to send, the email subject/body is logged to
-the server console. This means the entire notification flow can be
-demonstrated and tested locally with zero external accounts, while a real
-deployment only needs to flip one env var and supply SMTP credentials from
-any free-tier provider (Gmail App Password, Brevo, Mailtrap) to start sending
-real mail — no code changes required.
+4. Notification Flow
+
+Two things trigger emails, and both go through one wrapper, utils/email.js, built around Nodemailer:
+
+Status change. When an admin hits PATCH /complaints/:id/status, the history row gets written first, then the resident's email is looked up and a message goes out describing the new status and any note attached. This is fire-and-forget from the API's point of view: the response goes back to the admin right away, and the email fires off in the background, so a flaky SMTP provider can never hang or break the actual status update.
+Important notice posted. If an admin creates a notice and marks it isImportant: true, every resident gets emailed at once via Promise.all, same fire-and-forget approach.
+
+Both paths run through the same sendEmail() function, and it has a debug mode. Either you set EMAIL_DEBUG=true, or just leave SMTP credentials unset and it falls into debug mode automatically. In that mode nothing actually gets sent; the subject and body just get logged to the server console. Which means the whole notification flow is demoable and testable locally without signing up for anything. Flip the env var and drop in real SMTP credentials from whatever free-tier provider (Gmail App Password, Brevo, Mailtrap) and it starts sending real mail, no code changes needed.
